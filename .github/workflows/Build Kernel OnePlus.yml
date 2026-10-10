@@ -675,6 +675,10 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${KSU_MANAGER_BRANCH}/kernel/setup.sh" | bash -s "$KSU_BUILTIN_BRANCH"
           cd ./KernelSU
 
+          # fix: builtin kernel implements uapi5 features but reports uapi2 -> manager complains "kernel update required"
+          sed -i 's/KERNEL_SU_UAPI_VERSION, 2/KERNEL_SU_UAPI_VERSION, 5/' kernel/include/uapi/supercall.h
+          grep -n "KERNEL_SU_UAPI_VERSION" kernel/include/uapi/supercall.h | head -n1
+
           # 如果指定了手动 hash，就切换到该提交
           if [[ -n "$MANUAL_HASH" ]]; then
             git fetch origin "$KSU_BUILTIN_BRANCH" --depth=50
