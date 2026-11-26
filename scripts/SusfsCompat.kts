@@ -268,6 +268,143 @@ fun applyPostPatchFixups() {
             logPostfix(openC, "rewrote 3-arg getname_flags(filename, lookup_flags, NULL) calls to the 2-arg form getname_flags(filename, lookup_flags) required on this 6.12 baseline")
         }
     }
+
+    fixSusfsSusTypeCollision()
+}
+
+fun replaceFirstMatch(input: String, regex: Regex, transform: (MatchResult) -> String): String {
+    val m = regex.find(input) ?: return input
+    return input.replaceRange(m.range, transform(m))
+}
+
+/**
+ * Fix SUSFS selinux_hide SUS_TYPE_HLIST hash-bucket collision bug in fs/susfs.c:
+ * st_susfs_sus_type_hlist lacked a type_value field, causing susfs_is_sus_type_rcu()
+ * and susfs_add_sus_type() to match any SELinux type colliding in the 10-bit hash
+ * table (e.g. permissioncontroller_app=1849 colliding with ksu_file=4433 in bucket 261).
+ */
+fun fixSusfsSusTypeCollision() {
+    val susfs = f("fs/susfs.c")
+    if (!susfs.exists()) return
+
+    val normalized = susfs.readText().replace("\r\n", "\n")
+    if (!normalized.contains("SUS_TYPE_HLIST")) return
+    if (Regex("""struct\s+st_susfs_sus_type_hlist\s*\{[^}]*type_value\s*;""").containsMatchIn(normalized)) {
+        logPostfix(susfs, "SUS_TYPE_HLIST already stores/checks type_value, skipping collision fix")
+        return
+    }
+
+    val oldBlock = listOf(
+        "struct st_susfs_sus_type_hlist {",
+        "\tstruct hlist_node                       node;",
+        "};",
+        "",
+        "int susfs_add_sus_type(const char *secctx, u32 type_value) {",
+        "\tstruct st_susfs_sus_type_hlist *new_entry, *tmp_entry;",
+        "\tstruct hlist_node *tmp_hlist_node;",
+        "\tint err = 0;",
+        "",
+        "\tmutex_lock(&susfs_mutex_lock_sus_type);",
+        "\thash_for_each_possible_safe(SUS_TYPE_HLIST, tmp_entry, tmp_hlist_node, node, type_value) {",
+        "\t\tSUSFS_LOGE(\"secctx '%s', type_value '%u', was added before already\\n\",",
+        "\t\t\tsecctx, type_value);",
+        "\t\terr = -EINVAL;",
+        "\t\tgoto unlock;",
+        "\t}",
+        "",
+        "\tnew_entry = kzalloc(sizeof(struct st_susfs_sus_type_hlist), GFP_KERNEL);",
+        "\tif (!new_entry) {",
+        "\t\terr = -ENOMEM;",
+        "\t\tgoto unlock;",
+        "\t}",
+        "",
+        "\thash_add_rcu(SUS_TYPE_HLIST, &new_entry->node, type_value);",
+        "\tSUSFS_LOGI_RL(\"secctx '%s', type '%u', has been added to SUS_TYPE_HLIST\\n\",",
+        "\t\t\t\t\tsecctx, type_value);",
+        "unlock:",
+        "\tmutex_unlock(&susfs_mutex_lock_sus_type);",
+        "\treturn err;",
+        "}",
+        "",
+        "bool susfs_is_sus_type_rcu(u32 type_value) {",
+        "\tstruct st_susfs_sus_type_hlist *entry = NULL;",
+        "",
+        "\thash_for_each_possible_rcu(SUS_TYPE_HLIST, entry, node, type_value) {",
+        "\t\treturn true;",
+        "\t}",
+        "\treturn false;",
+        "}"
+    ).joinToString("\n")
+
+    val newBlock = listOf(
+        "struct st_susfs_sus_type_hlist {",
+        "\tu32                                     type_value;",
+        "\tstruct hlist_node                       node;",
+        "};",
+        "",
+        "int susfs_add_sus_type(const char *secctx, u32 type_value) {",
+        "\tstruct st_susfs_sus_type_hlist *new_entry, *tmp_entry;",
+        "\tstruct hlist_node *tmp_hlist_node;",
+        "\tint err = 0;",
+        "",
+        "\tmutex_lock(&susfs_mutex_lock_sus_type);",
+        "\thash_for_each_possible_safe(SUS_TYPE_HLIST, tmp_entry, tmp_hlist_node, node, type_value) {",
+        "\t\tif (tmp_entry->type_value == type_value) {",
+        "\t\t\tSUSFS_LOGE(\"secctx '%s', type_value '%u', was added before already\\n\",",
+        "\t\t\t\tsecctx, type_value);",
+        "\t\t\terr = -EINVAL;",
+        "\t\t\tgoto unlock;",
+        "\t\t}",
+        "\t}",
+        "",
+        "\tnew_entry = kzalloc(sizeof(struct st_susfs_sus_type_hlist), GFP_KERNEL);",
+        "\tif (!new_entry) {",
+        "\t\terr = -ENOMEM;",
+        "\t\tgoto unlock;",
+        "\t}",
+        "",
+        "\tnew_entry->type_value = type_value;",
+        "\thash_add_rcu(SUS_TYPE_HLIST, &new_entry->node, type_value);",
+        "\tSUSFS_LOGI_RL(\"secctx '%s', type '%u', has been added to SUS_TYPE_HLIST\\n\",",
+        "\t\t\t\t\tsecctx, type_value);",
+        "unlock:",
+        "\tmutex_unlock(&susfs_mutex_lock_sus_type);",
+        "\treturn err;",
+        "}",
+        "",
+        "bool susfs_is_sus_type_rcu(u32 type_value) {",
+        "\tstruct st_susfs_sus_type_hlist *entry = NULL;",
+        "",
+        "\thash_for_each_possible_rcu(SUS_TYPE_HLIST, entry, node, type_value) {",
+        "\t\tif (entry->type_value == type_value)",
+        "\t\t\treturn true;",
+        "\t}",
+        "\treturn false;",
+        "}"
+    ).joinToString("\n")
+
+    if (normalized.contains(oldBlock)) {
+        susfs.writeText(normalized.replace(oldBlock, newBlock))
+        logPostfix(susfs, "fixed SUS_TYPE_HLIST hash-collision bug: stored u32 type_value in st_susfs_sus_type_hlist and verified exact type_value equality in susfs_add_sus_type()/susfs_is_sus_type_rcu()")
+        return
+    }
+
+    // Fallback regex replacement in case upstream changes minor formatting in SUS_TYPE_HLIST
+    var updated = normalized
+    val r1 = Regex("""(struct st_susfs_sus_type_hlist \{\n)([ \t]*struct hlist_node)""")
+    val r2 = Regex("""(hash_for_each_possible_safe\(SUS_TYPE_HLIST,\s*tmp_entry,\s*tmp_hlist_node,\s*node,\s*type_value\)\s*\{\n)([ \t]*SUSFS_LOGE\([^;]+;\n[ \t]*err = -EINVAL;\n[ \t]*goto unlock;\n)([ \t]*\})""")
+    val r3 = Regex("""([ \t]*)(hash_add_rcu\(SUS_TYPE_HLIST,\s*&new_entry->node,\s*type_value\);)""")
+    val r4 = Regex("""(hash_for_each_possible_rcu\(SUS_TYPE_HLIST,\s*entry,\s*node,\s*type_value\)\s*\{\n)([ \t]*)(return true;)""")
+    if (r1.containsMatchIn(updated) && r2.containsMatchIn(updated) && r3.containsMatchIn(updated) && r4.containsMatchIn(updated)) {
+        updated = replaceFirstMatch(updated, r1) { m -> "${m.groupValues[1]}\tu32                                     type_value;\n${m.groupValues[2]}" }
+        updated = replaceFirstMatch(updated, r2) { m -> "${m.groupValues[1]}\t\tif (tmp_entry->type_value == type_value) {\n${m.groupValues[2]}\t\t}\n${m.groupValues[3]}" }
+        updated = replaceFirstMatch(updated, r3) { m -> "${m.groupValues[1]}new_entry->type_value = type_value;\n${m.groupValues[1]}${m.groupValues[2]}" }
+        updated = replaceFirstMatch(updated, r4) { m -> "${m.groupValues[1]}${m.groupValues[2]}if (entry->type_value == type_value)\n${m.groupValues[2]}\t${m.groupValues[3]}" }
+        susfs.writeText(updated)
+        logPostfix(susfs, "fixed SUS_TYPE_HLIST hash-collision bug via regex fallback")
+    } else {
+        System.err.println("[postfix]-fs/susfs.c: WARNING: SUS_TYPE_HLIST pattern did not match upstream susfs.c")
+    }
 }
 
 // Main
