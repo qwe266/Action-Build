@@ -270,6 +270,73 @@ fun applyPostPatchFixups() {
     }
 
     fixSusfsSusTypeCollision()
+    normalizeBuildMetadata()
+    extendKallsymsSymbolFilter()
+}
+
+fun normalizeBuildMetadata() {
+    val mkcompile = f("scripts/mkcompile_h")
+    if (!mkcompile.exists()) return
+
+    val content = mkcompile.readText().replace("\r\n", "\n")
+    if (content.contains("KBUILD_BUILD_USER:-build-user")) return
+
+    val lines = content.split("\n").toMutableList()
+    if (lines.isNotEmpty()) {
+        lines.addAll(
+            1,
+            listOf(
+                "KBUILD_BUILD_USER=\${KBUILD_BUILD_USER:-build-user}",
+                "KBUILD_BUILD_HOST=\${KBUILD_BUILD_HOST:-build-host}"
+            )
+        )
+        mkcompile.writeText(lines.joinToString("\n"))
+        logPostfix(mkcompile, "set default KBUILD_BUILD_USER=build-user and KBUILD_BUILD_HOST=build-host")
+    }
+}
+
+fun extendKallsymsSymbolFilter() {
+    val kallsyms = f("kernel/kallsyms.c")
+    if (!kallsyms.exists()) return
+
+    val content = kallsyms.readText().replace("\r\n", "\n")
+    val marker = """susfs_starts_with(iter->name, "is_zygote"))"""
+    if (!content.contains(marker) || content.contains("""susfs_starts_with(iter->name, "sukisu_")""")) return
+
+    val extraPrefixes = listOf(
+        "sukisu_",
+        "do_kpm",
+        "avc_spoof_",
+        "selinux_hide_",
+        "mount_hide_",
+        "uts_spoof_",
+        "anon_ksu_",
+        "setup_ksu_cred",
+        "is_task_ksu_domain",
+        "throne_tracker_",
+        "sulog_",
+        "do_get_sulog_",
+        "write_sulog",
+        "send_sulog_",
+        "kernel_adb_root_",
+        "bbg_",
+        "baseband_guard",
+        "handle_selinux_",
+        "handle_sel_write_"
+    )
+
+    val expanded = buildString {
+        append("""susfs_starts_with(iter->name, "is_zygote") ||""")
+        for ((idx, pfx) in extraPrefixes.withIndex()) {
+            append("\n\t\t\tsusfs_starts_with(iter->name, \"")
+            append(pfx)
+            append("\")")
+            append(if (idx == extraPrefixes.lastIndex) ")" else " ||")
+        }
+    }
+
+    kallsyms.writeText(content.replace(marker, expanded))
+    logPostfix(kallsyms, "extended s_show symbol filter prefixes")
 }
 
 fun replaceFirstMatch(input: String, regex: Regex, transform: (MatchResult) -> String): String {
